@@ -352,7 +352,7 @@ fn fast_batch_inversion(v: &mut [Fq], scratch: &mut [Fq]) {
 }
 
 // =========================================================
-// PHA 2: GIANT STEPS (UNSAFE NAKED MATH ENGINE)
+// PHA 2: GIANT STEPS (NAKED SoA ENGINE - BARE METAL AVX2)
 // =========================================================
 fn giant_step_worker(
     i_start: u64,
@@ -367,13 +367,18 @@ fn giant_step_worker(
     m: u64,
     real_start: Fr,
 ) {
-    let mut current_giant_pts = vec![Affine::zero(); BATCH_SIZE];
+    // 1. TÁCH RỜI TRỤC X VÀ Y (SoA) ĐỂ ÉP XUNG AVX2
+    let mut current_x = vec![Fq::zero(); BATCH_SIZE];
+    let mut current_y = vec![Fq::zero(); BATCH_SIZE];
+    
     for k in 0..BATCH_SIZE {
         let current_i = i_start + (k as u64);
         if current_i < i_end {
             let cand_base = Fr::from(current_i) * Fr::from(m);
             let offset_proj = fixed_base.mul(&cand_base);
-            current_giant_pts[k] = (p_prime_proj - offset_proj).into_affine();
+            let pt = (p_prime_proj - offset_proj).into_affine();
+            current_x[k] = pt.x;
+            current_y[k] = pt.y;
         }
     }
 
@@ -381,7 +386,10 @@ fn giant_step_worker(
     let giant_delta_proj = -(fixed_base.mul(&batch_m));
     let giant_delta_affine = giant_delta_proj.into_affine();
     
-    // Cấp phát tĩnh 1 lần duy nhất để tái sử dụng
+    // Đưa Delta vào biến nguyên thủy
+    let dx = giant_delta_affine.x;
+    let dy = giant_delta_affine.y;
+    
     let mut denoms = vec![Fq::one(); BATCH_SIZE];
     let mut scratch = vec![Fq::one(); BATCH_SIZE];
 
@@ -390,16 +398,14 @@ fn giant_step_worker(
 
     while current_i_base < i_end && KEEP_RUNNING.load(Ordering::Relaxed) {
         
-        // MỞ KHÓA UNSAFE: Hủy bỏ toàn bộ IF bounds-checking để LLVM bung AVX2
+        // MỞ KHÓA UNSAFE: Hủy bỏ toàn bộ Bounds-checking, bỏ qua lớp an toàn của ark_ec
         unsafe {
             for k in 0..BATCH_SIZE {
                 let current_i = current_i_base + (k as u64);
                 if current_i >= i_end { continue; }
                 
-                let pt = current_giant_pts.get_unchecked(k);
-                if pt.is_zero() { continue; }
-
-                let x_pref = extract_x_prefix(&pt.x);
+                let x_fq = current_x.get_unchecked(k);
+                let x_pref = extract_x_prefix(x_fq);
                 let h = (x_pref >> (64 - HASH_BITS)) as usize;
                 let start_idx = *hash_table.get_unchecked(h);
 
@@ -433,29 +439,28 @@ fn giant_step_worker(
                 local_counter = 0;
             }
 
-            // Gán mẫu số trực tiếp qua con trỏ
+            // 2. TÍNH TOÁN TRÊN BỘ NHỚ PHẲNG (Lõi toán học tương đương C++)
             for k in 0..BATCH_SIZE {
                 if current_i_base + (k as u64) < i_end {
-                    *denoms.get_unchecked_mut(k) = giant_delta_affine.x - current_giant_pts.get_unchecked(k).x;
+                    *denoms.get_unchecked_mut(k) = dx - *current_x.get_unchecked(k);
                 }
             }
             
-            // ÉP XUNG NGHỊCH ĐẢO: Zero-Allocation
             fast_batch_inversion(&mut denoms, &mut scratch);
 
-            // Tính điểm Affine trực tiếp
             for k in 0..BATCH_SIZE {
                 if current_i_base + (k as u64) < i_end {
-                    let pt = current_giant_pts.get_unchecked(k);
-                    if pt.is_zero() {
-                        *current_giant_pts.get_unchecked_mut(k) = giant_delta_affine;
-                    } else {
-                        let inv = denoms.get_unchecked(k);
-                        let lambda = (giant_delta_affine.y - pt.y) * inv;
-                        let x_new = (lambda * lambda) - pt.x - giant_delta_affine.x;
-                        let y_new = lambda * (pt.x - x_new) - pt.y;
-                        *current_giant_pts.get_unchecked_mut(k) = Affine::new_unchecked(x_new, y_new);
-                    }
+                    let inv = *denoms.get_unchecked(k);
+                    let cx = *current_x.get_unchecked(k);
+                    let cy = *current_y.get_unchecked(k);
+                    
+                    // Toán học Elliptic thuần túy không qua Struct
+                    let lambda = (dy - cy) * inv;
+                    let x_new = (lambda * lambda) - cx - dx;
+                    let y_new = lambda * (cx - x_new) - cy;
+                    
+                    *current_x.get_unchecked_mut(k) = x_new;
+                    *current_y.get_unchecked_mut(k) = y_new;
                 }
             }
         } // KẾT THÚC UNSAFE
