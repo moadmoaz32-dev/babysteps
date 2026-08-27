@@ -1,0 +1,7 @@
+[package]
+name = "csv_extractor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+csv = "1.3.0" # Thư viện đọc/ghi CSV nhanh nhất của Rust
