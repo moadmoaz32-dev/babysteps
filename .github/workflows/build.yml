@@ -1,0 +1,40 @@
+name: Build Linux Binary
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # TÙY CHỌN 1: Build cho CPU hiện đại có AVX2 (Đa số PC từ 2015 trở lên đều chạy được)
+      - name: Build release binary (AVX2 / x86-64-v3)
+        run: cargo build --release --verbose
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64-v3 -C llvm-args=-unroll-threshold=1000"
+
+      # TÙY CHỌN 2 (Thay thế Tùy chọn 1 nếu muốn cực độ): Build riêng cho CPU có AVX-512 (x86-64-v4)
+      # - name: Build release binary (AVX-512 / x86-64-v4)
+      #   run: cargo build --release --verbose
+      #   env:
+      #     RUSTFLAGS: "-C target-cpu=x86-64-v4 -C llvm-args=-unroll-threshold=1000"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plutus_rust_linux
+          path: target/release/plutus_rust
