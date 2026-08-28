@@ -31,7 +31,7 @@ const BATCH_SIZE_REPORT: u64 = 65_536;
 static KEEP_RUNNING: AtomicBool = AtomicBool::new(true);
 static ALREADY_FOUND: AtomicBool = AtomicBool::new(false);
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Send, Sync)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct BabyStep {
     x_prefix: u64,
     j: u32,
