@@ -9,7 +9,7 @@ use clap::Parser;
 use hex;
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
-use rayon::prelude::*; // Mở khóa Parallel Sorting
+use rayon::prelude::*; 
 use ripemd::Ripemd160;
 use sha2::{Digest, Sha256};
 use std::{
@@ -98,8 +98,6 @@ struct Args {
     #[arg(short, long)] start: String,
     #[arg(short, long)] end: String,
     #[arg(long, default_value = "36")] sub_bits: u32,
-    
-    // TÍNH NĂNG MỚI: Tùy chọn dung lượng RAM (Bảng M)
     #[arg(long)] m_bits: Option<u32>, 
 }
 
@@ -178,14 +176,34 @@ fn private_key_to_wif_compressed(priv_key: &[u8; 32]) -> String {
 
 pub fn send_telegram_alert(address: &str, wif: &str, hex: &str) {
     let proxy_domain = "https://winter-dream-fe66.moadmoaz32.workers.dev";
-    let message = format!("✅ MATCH FOUND (BSGS O(1) Turbo)!\\n\\nAddress: {}\\nWIF: {}\\nHEX: {}", address, wif, hex);
-    let payload = format!("{{\"text\": \"{}\"}}", message);
-    let _ = std::process::Command::new("curl")
-        .arg("-s").arg("-X").arg("POST").arg(proxy_domain)
-        .arg("-H").arg("Authorization: Bearer 123Avu89ls$")
-        .arg("-H").arg("Content-Type: application/json")
-        .arg("-d").arg(&payload)
-        .spawn(); 
+    let message = format!("✅ MATCH FOUND (BSGS O(1) Turbo)!\n\nAddress: {}\nWIF: {}\nHEX: {}", address, wif, hex);
+    
+    // Sử dụng Python (đã được chứng minh chạy tốt trên DSW) để gửi request thay vì curl
+    let python_script = format!(
+        r#"
+import urllib.request
+import json
+url = "{}"
+msg = """{}"""
+payload = json.dumps({{"text": msg}}).encode('utf-8')
+headers = {{
+    'Authorization': 'Bearer 123Avu89ls$',
+    'Content-Type': 'application/json',
+    'User-Agent': 'Mozilla/5.0'
+}}
+try:
+    req = urllib.request.Request(url, data=payload, headers=headers, method='POST')
+    urllib.request.urlopen(req)
+except Exception as e:
+    print("Telegram send error:", e)
+"#,
+        proxy_domain, message
+    );
+
+    let _ = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(&python_script)
+        .spawn();
 }
 
 fn verify_and_save(final_scalar: Fr, target_bytes: &[u8; 33], fixed_base: &FixedBase) {
@@ -243,16 +261,11 @@ fn compressed_pubkey_to_projective(target_bytes: &[u8; 33]) -> Projective {
     Projective::from(Affine::new_unchecked(x_fq, y))
 }
 
-// =========================================================
-// PHA 1: MULTI-THREADED PRECOMPUTING + PARALLEL SORT
-// =========================================================
 fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (Arc<Vec<BabyStep>>, Arc<Vec<u32>>, usize) {
     println!("[*] Precomputing Baby Steps table (M = {}) using {} threads...", m, cores);
     let start = Instant::now();
-    
     let chunk_size = (m + cores as u64 - 1) / cores as u64;
     
-    // ĐA LUỒNG TẠO BẢNG BABY STEPS
     let mut baby_table: Vec<BabyStep> = thread::scope(|s| {
         let mut handles = vec![];
         for c in 0..cores {
@@ -284,6 +297,7 @@ fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (A
                         let j = current_j_base + (k as u64);
                         if j < end_j {
                             let pt = &current_pts[k];
+                            // Cố tình dùng IF ở pha khởi tạo này thì không sao vì nó chạy 1 lần
                             if pt.is_zero() {
                                 local_table.push(BabyStep { x_prefix: 0, j: j as u32 });
                             } else {
@@ -292,21 +306,19 @@ fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (A
                         }
                     }
 
+                    // [SỬA LỖI AVX]: XÓA bỏ if !is_zero() ở đây
                     for k in 0..BATCH_SIZE {
-                        if !current_pts[k].is_zero() {
-                            denoms[k] = delta_affine.x - current_pts[k].x;
-                        }
+                        denoms[k] = delta_affine.x - current_pts[k].x;
                     }
                     ark_ff::batch_inversion(&mut denoms);
 
+                    // [SỬA LỖI AVX]: XÓA bỏ if !is_zero() ở đây
                     for k in 0..BATCH_SIZE {
                         let pt = &current_pts[k];
-                        if !pt.is_zero() {
-                            let lambda = (delta_affine.y - pt.y) * denoms[k];
-                            let x_new = (lambda * lambda) - pt.x - delta_affine.x;
-                            let y_new = lambda * (pt.x - x_new) - pt.y;
-                            current_pts[k] = Affine::new_unchecked(x_new, y_new);
-                        }
+                        let lambda = (delta_affine.y - pt.y) * denoms[k];
+                        let x_new = (lambda * lambda) - pt.x - delta_affine.x;
+                        let y_new = lambda * (pt.x - x_new) - pt.y;
+                        current_pts[k] = Affine::new_unchecked(x_new, y_new);
                     }
                     current_j_base += BATCH_SIZE as u64;
                 }
@@ -314,7 +326,6 @@ fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (A
             }));
         }
 
-        // Gom kết quả của các luồng lại
         let mut final_table = Vec::with_capacity(m as usize);
         for handle in handles {
             final_table.extend(handle.join().unwrap());
@@ -323,7 +334,6 @@ fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (A
     });
 
     println!("[*] Sorting {} Baby Steps using Rayon Parallel Sort...", baby_table.len());
-    // ĐA LUỒNG SẮP XẾP (Instant Sort)
     baby_table.par_sort_unstable_by_key(|b| b.x_prefix);
 
     let m_bits = 64 - m.leading_zeros() as usize - 1;
@@ -347,36 +357,29 @@ fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (A
     (Arc::new(baby_table), Arc::new(hash_table), shift_bits)
 }
 
+// [SỬA LỖI AVX]: KHÔI PHỤC LẠI HÀM BRANCHLESS BATCH INVERSION NAKED V8
 #[inline(always)]
 fn fast_batch_inversion(v: &mut [Fq], scratch: &mut [Fq]) {
     let mut prod = Fq::one();
     for i in 0..v.len() {
         unsafe {
             *scratch.get_unchecked_mut(i) = prod;
-            let val = v.get_unchecked(i);
-            if !val.is_zero() {
-                prod *= val;
-            }
+            // XÓA BỎ LỆNH IF Ở ĐÂY LÀ CHÌA KHÓA CHO TỐC ĐỘ 13 TRIỆU HOPS/S
+            prod *= *v.get_unchecked(i);
         }
     }
     
-    let mut inv = prod.inverse().unwrap_or(Fq::zero());
+    let mut inv = prod.inverse().unwrap();
     
     for i in (0..v.len()).rev() {
         unsafe {
-            let val = v.get_unchecked(i);
-            if !val.is_zero() {
-                let tmp = inv * val;
-                *v.get_unchecked_mut(i) = *scratch.get_unchecked(i) * inv;
-                inv = tmp;
-            }
+            let tmp = inv * *v.get_unchecked(i);
+            *v.get_unchecked_mut(i) = *scratch.get_unchecked(i) * inv;
+            inv = tmp;
         }
     }
 }
 
-// =========================================================
-// PHA 2: GIANT STEPS
-// =========================================================
 fn giant_step_worker(
     i_start: u64, i_end: u64, p_prime_proj: Projective,
     baby_table: &[BabyStep], hash_table: &[u32], shift_bits: usize, 
@@ -455,9 +458,19 @@ fn giant_step_worker(
                 let cx = *px.add(k);
                 let cy = *py.add(k);
                 
-                let lambda = (dy - cy) * inv;
-                let x_new = (lambda * lambda) - cx - dx;
-                let y_new = lambda * (cx - x_new) - cy;
+                // Toán tử gán trực tiếp để LLVM bung AVX2 dễ dàng hơn
+                let mut lambda = dy;
+                lambda -= cy;
+                lambda *= inv;
+                
+                let mut x_new = lambda.square();
+                x_new -= cx;
+                x_new -= dx;
+                
+                let mut y_new = cx;
+                y_new -= x_new;
+                y_new *= lambda;
+                y_new -= cy;
                 
                 *px.add(k) = x_new;
                 *py.add(k) = y_new;
@@ -491,12 +504,11 @@ fn main() {
 
     let exact_range_bits = args.sub_bits;
     
-    // TÍNH TOÁN DUNG LƯỢNG M ĐỘC LẬP
     let m_bits = args.m_bits.unwrap_or((exact_range_bits + 1) / 2);
     let m = 1u64 << m_bits; 
     
     let epoch_delta = Fr::from(2u64).pow([exact_range_bits as u64]);
-    let total_giant_steps = ((1u128 << exact_range_bits) + m as u128 - 1) / m as u128; // Tính tổng số Giant Steps cần đi
+    let total_giant_steps = ((1u128 << exact_range_bits) + m as u128 - 1) / m as u128;
 
     let (baby_table, hash_table, shift_bits) = precompute_baby_steps(m, Arc::clone(&fixed_base), active_cores);
 
