@@ -9,6 +9,7 @@ use clap::Parser;
 use hex;
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
+use rayon::prelude::*; // Mở khóa Parallel Sorting
 use ripemd::Ripemd160;
 use sha2::{Digest, Sha256};
 use std::{
@@ -24,19 +25,13 @@ use std::{
 
 const FOUND_FILE: &str = "plutus_found.txt";
 const WINDOW_SIZE: usize = 8;
-const BATCH_SIZE: usize = 1024; // Batch lớn để ép xung AVX2
+const BATCH_SIZE: usize = 256; 
 const BATCH_SIZE_REPORT: u64 = 65_536;
-
-// =========================================================
-// THÔNG SỐ HASH TABLE O(1) - ĐỘT PHÁ TỐC ĐỘ L3 CACHE
-// =========================================================
-const HASH_BITS: usize = 28; // Cắt 28 bit đầu của trục X làm địa chỉ
-const HASH_SIZE: usize = 1 << HASH_BITS; // 268,435,456 khe (Tốn đúng 1.07 GB RAM)
 
 static KEEP_RUNNING: AtomicBool = AtomicBool::new(true);
 static ALREADY_FOUND: AtomicBool = AtomicBool::new(false);
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Send, Sync)]
 struct BabyStep {
     x_prefix: u64,
     j: u32,
@@ -103,11 +98,14 @@ struct Args {
     #[arg(short, long)] start: String,
     #[arg(short, long)] end: String,
     #[arg(long, default_value = "36")] sub_bits: u32,
+    
+    // TÍNH NĂNG MỚI: Tùy chọn dung lượng RAM (Bảng M)
+    #[arg(long)] m_bits: Option<u32>, 
 }
 
 #[inline(always)]
 fn extract_x_prefix(x: &Fq) -> u64 {
-    x.into_bigint().0[0]
+    unsafe { *(x as *const Fq as *const u64) }
 }
 
 #[inline(always)]
@@ -187,7 +185,7 @@ pub fn send_telegram_alert(address: &str, wif: &str, hex: &str) {
         .arg("-H").arg("Authorization: Bearer 123Avu89ls$")
         .arg("-H").arg("Content-Type: application/json")
         .arg("-d").arg(&payload)
-        .spawn();
+        .spawn(); 
 }
 
 fn verify_and_save(final_scalar: Fr, target_bytes: &[u8; 33], fixed_base: &FixedBase) {
@@ -218,13 +216,13 @@ fn verify_and_save(final_scalar: Fr, target_bytes: &[u8; 33], fixed_base: &Fixed
 
     print!("{}", msg);
     std::io::stdout().flush().unwrap();
-
+    
     if let Ok(file) = OpenOptions::new().create(true).append(true).open(FOUND_FILE) {
         let mut writer = BufWriter::new(file);
         let _ = writer.write_all(msg.as_bytes());
         let _ = writer.flush();
     }
-
+    
     KEEP_RUNNING.store(false, Ordering::Release);
     send_telegram_alert(&addr, &wif, &hex_priv);
 }
@@ -246,86 +244,112 @@ fn compressed_pubkey_to_projective(target_bytes: &[u8; 33]) -> Projective {
 }
 
 // =========================================================
-// PHA 1: BABY STEPS (PARALLEL CHAINS)
+// PHA 1: MULTI-THREADED PRECOMPUTING + PARALLEL SORT
 // =========================================================
-fn precompute_baby_steps(m: u64, fixed_base: &FixedBase) -> (Arc<Vec<BabyStep>>, Arc<Vec<u32>>) {
-    println!("[*] Precomputing Baby Steps table (M = {})...", m);
+fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (Arc<Vec<BabyStep>>, Arc<Vec<u32>>, usize) {
+    println!("[*] Precomputing Baby Steps table (M = {}) using {} threads...", m, cores);
     let start = Instant::now();
-    let mut baby_table = Vec::with_capacity(m as usize);
+    
+    let chunk_size = (m + cores as u64 - 1) / cores as u64;
+    
+    // ĐA LUỒNG TẠO BẢNG BABY STEPS
+    let mut baby_table: Vec<BabyStep> = thread::scope(|s| {
+        let mut handles = vec![];
+        for c in 0..cores {
+            let fb = Arc::clone(&fixed_base);
+            let start_j = c as u64 * chunk_size;
+            let end_j = m.min(start_j + chunk_size);
+            
+            handles.push(s.spawn(move || {
+                let capacity = (end_j.saturating_sub(start_j)) as usize;
+                let mut local_table = Vec::with_capacity(capacity);
+                if capacity == 0 { return local_table; }
 
-    let mut current_pts = vec![Affine::zero(); BATCH_SIZE];
-    for k in 0..BATCH_SIZE {
-        if k > 0 {
-            current_pts[k] = fixed_base.mul(&Fr::from(k as u64)).into_affine();
-        }
-    }
-
-    let delta_proj = fixed_base.mul(&Fr::from(BATCH_SIZE as u64));
-    let delta_affine = delta_proj.into_affine();
-    let mut denoms = vec![Fq::one(); BATCH_SIZE];
-
-    let mut current_j_base = 0u64;
-
-    while current_j_base < m {
-        for k in 0..BATCH_SIZE {
-            let j = current_j_base + (k as u64);
-            if j < m {
-                let pt = &current_pts[k];
-                if pt.is_zero() {
-                    baby_table.push(BabyStep { x_prefix: 0, j: j as u32 });
-                } else {
-                    baby_table.push(BabyStep { x_prefix: extract_x_prefix(&pt.x), j: j as u32 });
+                let mut current_pts = vec![Affine::zero(); BATCH_SIZE];
+                for k in 0..BATCH_SIZE {
+                    let j_val = start_j + k as u64;
+                    if j_val < end_j {
+                        current_pts[k] = fb.mul(&Fr::from(j_val)).into_affine();
+                    }
                 }
-            }
+                
+                let delta_proj = fb.mul(&Fr::from(BATCH_SIZE as u64));
+                let delta_affine = delta_proj.into_affine();
+                let mut denoms = vec![Fq::one(); BATCH_SIZE];
+                
+                let mut current_j_base = start_j;
+
+                while current_j_base < end_j {
+                    for k in 0..BATCH_SIZE {
+                        let j = current_j_base + (k as u64);
+                        if j < end_j {
+                            let pt = &current_pts[k];
+                            if pt.is_zero() {
+                                local_table.push(BabyStep { x_prefix: 0, j: j as u32 });
+                            } else {
+                                local_table.push(BabyStep { x_prefix: extract_x_prefix(&pt.x), j: j as u32 });
+                            }
+                        }
+                    }
+
+                    for k in 0..BATCH_SIZE {
+                        if !current_pts[k].is_zero() {
+                            denoms[k] = delta_affine.x - current_pts[k].x;
+                        }
+                    }
+                    ark_ff::batch_inversion(&mut denoms);
+
+                    for k in 0..BATCH_SIZE {
+                        let pt = &current_pts[k];
+                        if !pt.is_zero() {
+                            let lambda = (delta_affine.y - pt.y) * denoms[k];
+                            let x_new = (lambda * lambda) - pt.x - delta_affine.x;
+                            let y_new = lambda * (pt.x - x_new) - pt.y;
+                            current_pts[k] = Affine::new_unchecked(x_new, y_new);
+                        }
+                    }
+                    current_j_base += BATCH_SIZE as u64;
+                }
+                local_table
+            }));
         }
 
-        for k in 0..BATCH_SIZE {
-            if !current_pts[k].is_zero() {
-                denoms[k] = delta_affine.x - current_pts[k].x;
-            }
+        // Gom kết quả của các luồng lại
+        let mut final_table = Vec::with_capacity(m as usize);
+        for handle in handles {
+            final_table.extend(handle.join().unwrap());
         }
-        ark_ff::batch_inversion(&mut denoms);
+        final_table
+    });
 
-        for k in 0..BATCH_SIZE {
-            let pt = &current_pts[k];
-            if pt.is_zero() {
-                current_pts[k] = delta_affine;
-            } else {
-                let lambda = (delta_affine.y - pt.y) * denoms[k];
-                let x_new = (lambda * lambda) - pt.x - delta_affine.x;
-                let y_new = lambda * (pt.x - x_new) - pt.y;
-                current_pts[k] = Affine::new_unchecked(x_new, y_new);
-            }
-        }
-        current_j_base += BATCH_SIZE as u64;
-    }
+    println!("[*] Sorting {} Baby Steps using Rayon Parallel Sort...", baby_table.len());
+    // ĐA LUỒNG SẮP XẾP (Instant Sort)
+    baby_table.par_sort_unstable_by_key(|b| b.x_prefix);
 
-    println!("[*] Sorting {} Baby Steps...", baby_table.len());
-    baby_table.sort_unstable_by_key(|b| b.x_prefix);
-
-    println!("[*] Building O(1) Hash Table ({} bits / ~1 GB RAM)...", HASH_BITS);
-    let mut hash_table = vec![u32::MAX; HASH_SIZE];
-
+    let m_bits = 64 - m.leading_zeros() as usize - 1;
+    let dynamic_hash_bits = m_bits.min(28); 
+    let shift_bits = 64 - dynamic_hash_bits;
+    let hash_size = 1 << dynamic_hash_bits;
+    
+    let mut hash_table = vec![u32::MAX; hash_size];
+    
     for (i, step) in baby_table.iter().enumerate() {
-        let h = (step.x_prefix >> (64 - HASH_BITS)) as usize;
+        let h = (step.x_prefix >> shift_bits) as usize;
         if hash_table[h] == u32::MAX {
             hash_table[h] = i as u32;
         }
     }
 
-    let total_ram_mb = (baby_table.len() * std::mem::size_of::<BabyStep>() + hash_table.len() * 4) as f64 / (1024.0 * 1024.0);
-    println!("[+] Core memory map initialized in {:.2}s. Total memory footprint: ~{:.2} MB", start.elapsed().as_secs_f64(), total_ram_mb);
+    let total_ram_mb = (baby_table.len() * std::mem::size_of::<BabyStep>() + hash_table.len() * 4) as f64 / 1_048_576.0;
+    println!("[*] Building O(1) Hash Table ({} bits / ~{:.2} MB RAM)...", dynamic_hash_bits, total_ram_mb);
+    println!("[+] Core memory map initialized in {:.2}s.", start.elapsed().as_secs_f64());
 
-    (Arc::new(baby_table), Arc::new(hash_table))
+    (Arc::new(baby_table), Arc::new(hash_table), shift_bits)
 }
 
-// =========================================================
-// ĐỘNG CƠ LÕI: ZERO-ALLOC BATCH INVERSION (BYPASS ARK_FF)
-// =========================================================
 #[inline(always)]
 fn fast_batch_inversion(v: &mut [Fq], scratch: &mut [Fq]) {
     let mut prod = Fq::one();
-    // Vòng lặp xuôi: Tính tích lũy
     for i in 0..v.len() {
         unsafe {
             *scratch.get_unchecked_mut(i) = prod;
@@ -338,7 +362,6 @@ fn fast_batch_inversion(v: &mut [Fq], scratch: &mut [Fq]) {
     
     let mut inv = prod.inverse().unwrap_or(Fq::zero());
     
-    // Vòng lặp ngược: Phân phối nghịch đảo
     for i in (0..v.len()).rev() {
         unsafe {
             let val = v.get_unchecked(i);
@@ -352,22 +375,14 @@ fn fast_batch_inversion(v: &mut [Fq], scratch: &mut [Fq]) {
 }
 
 // =========================================================
-// PHA 2: GIANT STEPS (NAKED SoA ENGINE - BARE METAL AVX2)
+// PHA 2: GIANT STEPS
 // =========================================================
 fn giant_step_worker(
-    i_start: u64,
-    i_end: u64,
-    p_prime_proj: Projective,
-    _neg_m_g_affine: Affine,
-    baby_table: &[BabyStep],
-    hash_table: &[u32],
-    target_bytes: &[u8; 33],
-    fixed_base: &FixedBase,
-    keys_scanned: &AtomicU64,
-    m: u64,
-    real_start: Fr,
+    i_start: u64, i_end: u64, p_prime_proj: Projective,
+    baby_table: &[BabyStep], hash_table: &[u32], shift_bits: usize, 
+    target_bytes: &[u8; 33], fixed_base: &FixedBase,
+    keys_scanned: &AtomicU64, m: u64, real_start: Fr,
 ) {
-    // 1. TÁCH RỜI TRỤC X VÀ Y (SoA) ĐỂ ÉP XUNG AVX2
     let mut current_x = vec![Fq::zero(); BATCH_SIZE];
     let mut current_y = vec![Fq::zero(); BATCH_SIZE];
     
@@ -386,7 +401,6 @@ fn giant_step_worker(
     let giant_delta_proj = -(fixed_base.mul(&batch_m));
     let giant_delta_affine = giant_delta_proj.into_affine();
     
-    // Đưa Delta vào biến nguyên thủy
     let dx = giant_delta_affine.x;
     let dy = giant_delta_affine.y;
     
@@ -396,27 +410,27 @@ fn giant_step_worker(
     let mut current_i_base = i_start;
     let mut local_counter = 0u64;
 
+    let px = current_x.as_mut_ptr();
+    let py = current_y.as_mut_ptr();
+    let pden = denoms.as_mut_ptr();
+
     while current_i_base < i_end && KEEP_RUNNING.load(Ordering::Relaxed) {
-        
-        // MỞ KHÓA UNSAFE: Hủy bỏ toàn bộ Bounds-checking, bỏ qua lớp an toàn của ark_ec
         unsafe {
             for k in 0..BATCH_SIZE {
-                let current_i = current_i_base + (k as u64);
-                if current_i >= i_end { continue; }
-                
-                let x_fq = current_x.get_unchecked(k);
-                let x_pref = extract_x_prefix(x_fq);
-                let h = (x_pref >> (64 - HASH_BITS)) as usize;
+                let cx = *px.add(k);
+                let x_pref = extract_x_prefix(&cx);
+                let h = (x_pref >> shift_bits) as usize;
                 let start_idx = *hash_table.get_unchecked(h);
 
                 if start_idx != u32::MAX {
+                    let current_i = current_i_base + (k as u64);
                     let mut match_idx = start_idx as usize;
                     while match_idx < baby_table.len() {
                         let step = baby_table.get_unchecked(match_idx);
-                        let step_h = (step.x_prefix >> (64 - HASH_BITS)) as usize;
+                        let step_h = (step.x_prefix >> shift_bits) as usize;
                         if step_h != h { break; } 
 
-                        if step.x_prefix == x_pref {
+                        if step.x_prefix == x_pref && current_i < i_end {
                             let j = step.j;
                             let cand_base = Fr::from(current_i) * Fr::from(m);
                             
@@ -431,41 +445,32 @@ fn giant_step_worker(
                         match_idx += 1;
                     }
                 }
-                local_counter += 1;
+                *pden.add(k) = dx - cx;
             }
 
-            if local_counter >= BATCH_SIZE_REPORT {
-                keys_scanned.fetch_add(local_counter, Ordering::Relaxed);
-                local_counter = 0;
-            }
-
-            // 2. TÍNH TOÁN TRÊN BỘ NHỚ PHẲNG (Lõi toán học tương đương C++)
-            for k in 0..BATCH_SIZE {
-                if current_i_base + (k as u64) < i_end {
-                    *denoms.get_unchecked_mut(k) = dx - *current_x.get_unchecked(k);
-                }
-            }
-            
             fast_batch_inversion(&mut denoms, &mut scratch);
 
             for k in 0..BATCH_SIZE {
-                if current_i_base + (k as u64) < i_end {
-                    let inv = *denoms.get_unchecked(k);
-                    let cx = *current_x.get_unchecked(k);
-                    let cy = *current_y.get_unchecked(k);
-                    
-                    // Toán học Elliptic thuần túy không qua Struct
-                    let lambda = (dy - cy) * inv;
-                    let x_new = (lambda * lambda) - cx - dx;
-                    let y_new = lambda * (cx - x_new) - cy;
-                    
-                    *current_x.get_unchecked_mut(k) = x_new;
-                    *current_y.get_unchecked_mut(k) = y_new;
-                }
+                let inv = *pden.add(k);
+                let cx = *px.add(k);
+                let cy = *py.add(k);
+                
+                let lambda = (dy - cy) * inv;
+                let x_new = (lambda * lambda) - cx - dx;
+                let y_new = lambda * (cx - x_new) - cy;
+                
+                *px.add(k) = x_new;
+                *py.add(k) = y_new;
             }
-        } // KẾT THÚC UNSAFE
+        } 
         
         current_i_base += BATCH_SIZE as u64;
+        local_counter += BATCH_SIZE as u64;
+
+        if local_counter >= BATCH_SIZE_REPORT {
+            keys_scanned.fetch_add(local_counter, Ordering::Relaxed);
+            local_counter = 0;
+        }
     }
 }
 
@@ -485,16 +490,15 @@ fn main() {
     let fixed_base = Arc::new(FixedBase::new(WINDOW_SIZE));
 
     let exact_range_bits = args.sub_bits;
-    let m_bits = (exact_range_bits + 1) / 2;
-    let m = 1u64 << m_bits;
+    
+    // TÍNH TOÁN DUNG LƯỢNG M ĐỘC LẬP
+    let m_bits = args.m_bits.unwrap_or((exact_range_bits + 1) / 2);
+    let m = 1u64 << m_bits; 
+    
     let epoch_delta = Fr::from(2u64).pow([exact_range_bits as u64]);
+    let total_giant_steps = ((1u128 << exact_range_bits) + m as u128 - 1) / m as u128; // Tính tổng số Giant Steps cần đi
 
-    // [FIX]: Bổ sung tham số fixed_base vào hàm precompute_baby_steps
-    let (baby_table, hash_table) = precompute_baby_steps(m, &fixed_base);
-
-    let m_scalar = Fr::from(m);
-    let m_g_proj = fixed_base.mul(&m_scalar);
-    let neg_m_g_affine = (-m_g_proj).into_affine();
+    let (baby_table, hash_table, shift_bits) = precompute_baby_steps(m, Arc::clone(&fixed_base), active_cores);
 
     ctrlc::set_handler(move || {
         KEEP_RUNNING.store(false, Ordering::Release);
@@ -509,7 +513,7 @@ fn main() {
 
     let mut epoch_rng = make_fast_rng(std::process::id() as usize ^ 0x1337);
     let mut epoch: u64 = 1;
-    let total_subrange_keys = 1u64 << exact_range_bits;
+    let total_subrange_keys = 1u128 << exact_range_bits;
 
     while KEEP_RUNNING.load(Ordering::Relaxed) {
         let random_offset = if master_span.is_zero() {
@@ -520,13 +524,15 @@ fn main() {
         let real_start = master_start + random_offset;
         let real_end = real_start + epoch_delta - Fr::one();
 
-        println!("\n=== EPOCH {} (BSGS O(1) Turbo - Size 2^{}) ===", epoch, exact_range_bits);
+        println!("\n=== EPOCH {} (BSGS O(1) Turbo - Range 2^{} | RAM M=2^{}) ===", epoch, exact_range_bits, m_bits);
         println!("   Sub-range Start      : 0x{}", hex::encode(scalar_to_bytes(real_start)).trim_start_matches('0'));
         println!("   Sub-range End        : 0x{}", hex::encode(scalar_to_bytes(real_end)).trim_start_matches('0'));
 
         let p_prime = target_projective - fixed_base.mul(&real_start);
         let keys_scanned = Arc::new(AtomicU64::new(0));
-        let chunk_per_core = (m + active_cores as u64 - 1) / active_cores as u64;
+        
+        let chunk_per_core_raw = (total_giant_steps as u64 + active_cores as u64 - 1) / active_cores as u64;
+        let chunk_per_core = ((chunk_per_core_raw + BATCH_SIZE as u64 - 1) / BATCH_SIZE as u64) * BATCH_SIZE as u64;
 
         let start_time = Instant::now();
         let mut last_ui = Instant::now();
@@ -535,7 +541,9 @@ fn main() {
         thread::scope(|s| {
             for core_id in 0..active_cores {
                 let i_start = (core_id as u64) * chunk_per_core;
-                let i_end = ((core_id as u64 + 1) * chunk_per_core).min(m);
+                let i_end = ((core_id as u64 + 1) * chunk_per_core).min(total_giant_steps as u64);
+                let i_end_padded = ((i_end + BATCH_SIZE as u64 - 1) / BATCH_SIZE as u64) * BATCH_SIZE as u64;
+                
                 let baby_ref = Arc::clone(&baby_table);
                 let hash_ref = Arc::clone(&hash_table);
                 let fb_ref = Arc::clone(&fixed_base);
@@ -543,8 +551,8 @@ fn main() {
 
                 s.spawn(move || {
                     giant_step_worker(
-                        i_start, i_end, p_prime, neg_m_g_affine,
-                        &baby_ref, &hash_ref, &target_bytes, &fb_ref,
+                        i_start, i_end_padded, p_prime,
+                        &baby_ref, &hash_ref, shift_bits, &target_bytes, &fb_ref,
                         &ks_ref, m, real_start,
                     );
                 });
@@ -552,16 +560,16 @@ fn main() {
 
             while KEEP_RUNNING.load(Ordering::Relaxed) {
                 let current_keys = keys_scanned.load(Ordering::Relaxed);
-                if current_keys >= m { break; }
+                if current_keys >= total_giant_steps as u64 { break; }
 
-                if last_ui.elapsed().as_secs_f64() >= 0.5 {
+                if last_ui.elapsed().as_secs_f64() >= 5.0 {
                     let rate = ((current_keys.checked_sub(last_ui_keys).unwrap_or(0)) as f64 / last_ui.elapsed().as_secs_f64()) as u64;
                     last_ui_keys = current_keys;
                     last_ui = Instant::now();
 
-                    let pct = (current_keys as f64 / m as f64) * 100.0;
-                    print!("\r\x1B[2K[Epoch {} | {:.2}%] Giant Steps: {}/{} | Speed: {} Keys/s",
-                        epoch, pct, current_keys, m, rate
+                    let pct = (current_keys as f64 / total_giant_steps as f64) * 100.0;
+                    print!("\r\x1B[2K[Epoch {} | {:.2}%] Giant Steps: {}/{} | Speed: {} GS/s",
+                        epoch, pct, current_keys, total_giant_steps, rate
                     );
                     std::io::stdout().flush().unwrap();
                 }
@@ -570,7 +578,12 @@ fn main() {
         });
 
         let elapsed = start_time.elapsed().as_secs_f64();
-        println!("\r\x1B[2K[+] Epoch {} Finished in {:.2}s. Verified {} keys exhaustively.", epoch, elapsed, total_subrange_keys);
+        let hardware_speed = (total_giant_steps as f64 / elapsed) as u64; 
+        let coverage_speed = (total_subrange_keys as f64 / elapsed) as u128;
+        
+        println!("\r\x1B[2K[+] Epoch {} Finished in {:.2}s.", epoch, elapsed);
+        println!("    -> Hardware Engine : {} Giant-Steps/s", hardware_speed);
+        println!("    -> Coverage Speed  : {} Keys/s (Verified exhaustively)", coverage_speed);
         epoch += 1;
     }
 }
