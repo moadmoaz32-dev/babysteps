@@ -178,7 +178,6 @@ pub fn send_telegram_alert(address: &str, wif: &str, hex: &str) {
     let proxy_domain = "https://winter-dream-fe66.moadmoaz32.workers.dev";
     let message = format!("✅ MATCH FOUND (BSGS O(1) Turbo)!\n\nAddress: {}\nWIF: {}\nHEX: {}", address, wif, hex);
     
-    // Sử dụng Python (đã được chứng minh chạy tốt trên DSW) để gửi request thay vì curl
     let python_script = format!(
         r#"
 import urllib.request
@@ -194,16 +193,24 @@ headers = {{
 try:
     req = urllib.request.Request(url, data=payload, headers=headers, method='POST')
     urllib.request.urlopen(req)
+    print("Telegram alert sent successfully via Python!")
 except Exception as e:
     print("Telegram send error:", e)
 "#,
         proxy_domain, message
     );
 
-    let _ = std::process::Command::new("python3")
+    println!("[*] Sending Telegram alert... Do not close the program!");
+    
+    // Đổi từ .spawn() sang .status() để Block tiến trình mẹ, đợi Python gửi xong HTTP Request
+    let result = std::process::Command::new("python3")
         .arg("-c")
         .arg(&python_script)
-        .spawn();
+        .status();
+
+    if let Err(e) = result {
+        println!("[-] Failed to trigger Python script: {}", e);
+    }
 }
 
 fn verify_and_save(final_scalar: Fr, target_bytes: &[u8; 33], fixed_base: &FixedBase) {
