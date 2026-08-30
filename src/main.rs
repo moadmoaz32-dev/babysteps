@@ -303,7 +303,6 @@ fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (A
                 let mut local_table = Vec::with_capacity(capacity);
                 if capacity == 0 { return local_table; }
 
-                // [ĐÃ SỬA]: Áp dụng Static Arrays cho quá trình Sinh bảng
                 let mut current_pts = [Affine::zero(); BATCH_SIZE];
                 for k in 0..BATCH_SIZE {
                     let j_val = start_j + k as u64;
@@ -314,7 +313,7 @@ fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (A
 
                 let delta_proj = fb.mul(&Fr::from(BATCH_SIZE as u64));
                 let delta_affine = delta_proj.into_affine();
-                
+
                 let mut denoms = [Fq::one(); BATCH_SIZE];
                 let mut scratch = [Fq::one(); BATCH_SIZE];
 
@@ -337,7 +336,7 @@ fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (A
                         for k in 0..BATCH_SIZE {
                             *denoms.get_unchecked_mut(k) = delta_affine.x - current_pts.get_unchecked(k).x;
                         }
-                        
+
                         fast_batch_inversion(&mut denoms, &mut scratch);
 
                         for k in 0..BATCH_SIZE {
@@ -346,16 +345,16 @@ fn precompute_baby_steps(m: u64, fixed_base: Arc<FixedBase>, cores: usize) -> (A
                             let mut lambda = delta_affine.y;
                             lambda -= pt.y;
                             lambda *= inv;
-                            
+
                             let mut x_new = lambda.square();
                             x_new -= pt.x;
                             x_new -= delta_affine.x;
-                            
+
                             let mut y_new = pt.x;
                             y_new -= x_new;
                             y_new *= lambda;
                             y_new -= pt.y;
-                            
+
                             *current_pts.get_unchecked_mut(k) = Affine::new_unchecked(x_new, y_new);
                         }
                     }
@@ -425,8 +424,7 @@ fn giant_step_worker(
 
     let mut denoms = [Fq::one(); BATCH_SIZE];
     let mut scratch = [Fq::one(); BATCH_SIZE];
-    
-    // Mảng lưu trữ địa chỉ prefetch để loại bỏ tính toán lặp lại
+
     let mut h_vals = [0usize; BATCH_SIZE];
     let mut x_prefs = [0u64; BATCH_SIZE];
 
@@ -435,35 +433,49 @@ fn giant_step_worker(
 
     while current_i_base < i_end && KEEP_RUNNING.load(Ordering::Relaxed) {
         unsafe {
-            // [VŨ KHÍ TỐI THƯỢNG]: Kích hoạt đường ống Pipelined Memory Fetch
+            let mut start_indices = [u32::MAX; BATCH_SIZE];
+
+            // --- PASS 1: Tính toán Hash & Đặt hàng Hash Table từ RAM ---
             for k in 0..BATCH_SIZE {
                 let cx = *current_x.get_unchecked(k);
                 *denoms.get_unchecked_mut(k) = dx - cx;
 
                 let x_pref = extract_x_prefix(&cx);
                 let h = (x_pref >> shift_bits) as usize;
-                
                 *x_prefs.get_unchecked_mut(k) = x_pref;
                 *h_vals.get_unchecked_mut(k) = h;
 
-                // Tín hiệu phần cứng: Gọi RAM tải trước dữ liệu L1 Cache
                 #[cfg(target_arch = "x86_64")]
                 core::arch::x86_64::_mm_prefetch(
-                    hash_table.as_ptr().add(h) as *const i8, 
+                    hash_table.as_ptr().add(h) as *const i8,
                     core::arch::x86_64::_MM_HINT_T0
                 );
             }
 
-            // Giai đoạn tra cứu O(1): Dữ liệu giờ đã nằm trong L1 Cache (0 đợi chờ)
+            // --- PASS 2: Đọc Hash Table & Đặt hàng Baby Table từ RAM ---
             for k in 0..BATCH_SIZE {
                 let h = *h_vals.get_unchecked(k);
                 let start_idx = *hash_table.get_unchecked(h);
+                *start_indices.get_unchecked_mut(k) = start_idx;
 
                 if start_idx != u32::MAX {
+                    #[cfg(target_arch = "x86_64")]
+                    core::arch::x86_64::_mm_prefetch(
+                        baby_table.as_ptr().add(start_idx as usize) as *const i8,
+                        core::arch::x86_64::_MM_HINT_T0
+                    );
+                }
+            }
+
+            // --- PASS 3: Xử lý Logic (Dữ liệu đã bày sẵn trên L1 Cache) ---
+            for k in 0..BATCH_SIZE {
+                let start_idx = *start_indices.get_unchecked(k);
+                if start_idx != u32::MAX {
+                    let h = *h_vals.get_unchecked(k);
                     let current_i = current_i_base + (k as u64);
-                    let mut match_idx = start_idx as usize;
                     let target_x_pref = *x_prefs.get_unchecked(k);
-                    
+                    let mut match_idx = start_idx as usize;
+
                     while match_idx < baby_table.len() {
                         let step = baby_table.get_unchecked(match_idx);
                         let step_h = (step.x_prefix >> shift_bits) as usize;
@@ -510,7 +522,7 @@ fn giant_step_worker(
                 *current_x.get_unchecked_mut(k) = x_new;
                 *current_y.get_unchecked_mut(k) = y_new;
             }
-        }
+        } // Hết unsafe
 
         current_i_base += BATCH_SIZE as u64;
         local_counter += BATCH_SIZE as u64;
@@ -519,6 +531,11 @@ fn giant_step_worker(
             keys_scanned.fetch_add(local_counter, Ordering::Relaxed);
             local_counter = 0;
         }
+    } // Hết while loop của Worker
+
+    // [VÁ LỖI TREO KHI QUÉT NHANH]: Trả nốt số liệu quét còn dư lại trước khi luồng chết
+    if local_counter > 0 {
+        keys_scanned.fetch_add(local_counter, Ordering::Relaxed);
     }
 }
 
@@ -539,6 +556,7 @@ fn main() {
 
     let exact_range_bits = args.sub_bits;
 
+    // [ĐÃ SỬA]: Cho phép hệ thống tự động cân đối RAM để vừa khít L3 Cache thay vì ép phần cứng
     let m_bits = args.m_bits.unwrap_or((exact_range_bits + 1) / 2);
     let m = 1u64 << m_bits;
 
@@ -574,6 +592,10 @@ fn main() {
         println!("\n=== EPOCH {} (BSGS ASM Turbo - Range 2^{} | RAM M=2^{}) ===", epoch, exact_range_bits, m_bits);
         println!("   Sub-range Start      : 0x{}", hex::encode(scalar_to_bytes(real_start)).trim_start_matches('0'));
         println!("   Sub-range End        : 0x{}", hex::encode(scalar_to_bytes(real_end)).trim_start_matches('0'));
+        println!("   Total Giant Steps    : {}", total_giant_steps);
+        
+        // [VÁ LỖI HIỂN THỊ]: Ép in log ra ngay lập tức, không cho kẹt trong Buffer
+        std::io::stdout().flush().unwrap();
 
         let p_prime = target_projective - fixed_base.mul(&real_start);
         let keys_scanned = Arc::new(AtomicU64::new(0));
@@ -609,7 +631,8 @@ fn main() {
                 let current_keys = keys_scanned.load(Ordering::Relaxed);
                 if current_keys >= total_giant_steps as u64 { break; }
 
-                if last_ui.elapsed().as_secs_f64() >= 5.0 {
+                // [ĐÃ SỬA]: Báo cáo log ra màn hình 1.0 giây/lần thay vì chờ 5.0 giây
+                if last_ui.elapsed().as_secs_f64() >= 1.0 {
                     let rate = ((current_keys.checked_sub(last_ui_keys).unwrap_or(0)) as f64 / last_ui.elapsed().as_secs_f64()) as u64;
                     last_ui_keys = current_keys;
                     last_ui = Instant::now();
